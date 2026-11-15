@@ -1,0 +1,110 @@
+From b7710f1715d759703f189099f18c5a201b330a02 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:37:49 +0000
+Subject: [PATCH] glm: queued warm passes capped at one a lane, so a foreground
+ backlog cannot pile them up
+
+Patch 0104's warm turns submit a background prompt-only pass after every reply. Foreground requests queue ahead
+of every background one, so while a foreground request is always waiting (more agents than lanes) no warm pass
+ever reaches the head: it is neither run nor stepped aside, it just waits. Each reply queued another, each
+holding its conversation's rendering (two renderings, chunk starts, decode spans; tens of MB at 100K+ tokens).
+
+Seen on the served pair on 2026-11-15: six requests arrived within 300 ms at 03:12:15, the 4 lanes stayed
+oversubscribed, the last warm pass to step aside did so at 03:12:15, and 137 passes were still queued at
+03:58. MemAvailable on rank 0 fell about 1 GiB every 10 minutes from 03:10 until memguard stopped the pair
+under its 2.5 GiB floor; all 137 then failed with "server restarting".
+
+- core/lane_host.zig: submitting a background job names the oldest queued background jobs beyond one a lane
+  for cancellation (capBackground); the engine loop's takeCancels ends them like any cancel, so they log
+  "stepped aside" and free their arena. Admitted passes and foreground requests are untouched. A pass that
+  waited behind newer replies is stale anyway: its conversation has usually moved on.
+- core/lane_host_warm_test.zig: five passes queued behind a foreground request at two lanes: the three
+  oldest are named and end cancelled, the request completes, the newest two end. It fails without the change
+  (no cancels named).
+
+Tests: the engine seam's suite (engine_api.zig with lanes and sys), 409 of 409 pass on aarch64.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/core/lane_host.zig           | 23 +++++++++++++++++++++
+ zig/src/core/lane_host_warm_test.zig | 30 ++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5ca02b978..048f18794 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -182,9 +182,32 @@ pub const LaneHost = struct {
+             h.gpa.destroy(job);
+             return error.Busy;
+         };
++        if (request.background) h.capBackground();
+         h.wake.signal(h.io);
+     }
+ 
++    /// Queued background passes kept at most one a lane: the oldest beyond that are named for cancellation, the
++    /// caller holding the lock. Foreground requests queue ahead of every background one, so under a steady
++    /// foreground backlog no warm pass reaches the head; without a cap each reply queued another, each holding its
++    /// conversation's rendering (tens of MB at 100K+ tokens) until the server ran out of memory. A pass that waited
++    /// behind newer replies is stale anyway: its conversation has usually moved on.
++    fn capBackground(h: *LaneHost) void {
++        const cap = @max(1, h.info_.lanes);
++        var waiting: usize = 0;
++        for (h.queued.items) |j| { // ones already named go at the next takeCancels: they do not count
++            if (j.request.background and std.mem.indexOfScalar(Id, h.cancels.items, j.id) == null) waiting += 1;
++        }
++        if (waiting <= cap) return;
++        var over = waiting - cap;
++        for (h.queued.items) |j| { // background jobs sit in arrival order behind the foreground ones: oldest first
++            if (over == 0) break;
++            if (!j.request.background) continue;
++            if (std.mem.indexOfScalar(Id, h.cancels.items, j.id) != null) continue;
++            h.cancels.append(h.gpa, j.id) catch return; // no memory to name it: it stays queued, as before
++            over -= 1;
++        }
++    }
++
+     fn cancelFn(ctx: *anyopaque, id: Id) void {
+         const h = self(ctx);
+         h.mutex.lockUncancelable(h.io);
+diff --git a/zig/src/core/lane_host_warm_test.zig b/zig/src/core/lane_host_warm_test.zig
+index 01a3eb1fd..0a29b0e85 100644
+--- a/zig/src/core/lane_host_warm_test.zig
++++ b/zig/src/core/lane_host_warm_test.zig
+@@ -353,3 +353,33 @@ test "a warm pass steps aside for a request admitted ahead of it whose prompt is
+     try std.testing.expectEqual(Reason.length, real.wait());
+     try std.testing.expectEqual(@as(usize, 48), real.tokens);
+ }
++
++test "queued warm passes are capped at one a lane: under a foreground backlog the oldest are cancelled, not kept" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
++    defer host.stop();
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 48 };
++    const warm_request: Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true };
++    var real: Box = .{};
++    var warm: [5]Box = .{ .{}, .{}, .{}, .{}, .{} };
++    // before the engine thread starts nothing is admitted: every submit stays queued, as behind a backlog
++    try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
++    for (&warm, 0..) |*b, i| try host.engine().submit(@intCast(10 + i), &warm_request, .{ .ctx = b, .event = Box.event });
++    host.lock();
++    const named = try gpa.dupe(Id, host.cancels.items);
++    host.unlock();
++    defer gpa.free(named);
++    try std.testing.expectEqualSlices(Id, &.{ 10, 11, 12 }, named); // the three oldest; the newest two (one a lane) stay
++    try host.start();
++    try std.testing.expectEqual(Reason.length, real.wait());
++    for (warm[0..3]) |*b| try std.testing.expectEqual(Reason.cancelled, b.wait());
++    for (warm[3..]) |*b| _ = b.wait(); // the kept two run or step aside; either way they end
++}
+-- 
+2.43.0
+

@@ -1,5 +1,17 @@
 # Changelog
 
+- **2026-11-15** -- `0122`: queued warm passes (patch `0104`) are capped at one a lane; the oldest beyond that are
+  cancelled when a newer one is submitted. Foreground requests queue ahead of background ones, so while more agents
+  than lanes kept a request always waiting, no warm pass reached the head and every reply queued another, each holding
+  its conversation's rendering. On the pair: six requests at 03:12:15 kept 4 lanes oversubscribed, 137 passes were
+  queued by 03:58, rank 0's MemAvailable fell about 1 GiB every 10 minutes and memguard stopped the pair. New test in
+  `lane_host_warm_test.zig` (fails without the change); the engine seam's 409 tests pass.
+
+- **2026-11-15** -- `scripts/watchdog.sh`: polls `/health` and runs `./start.sh` after an unplanned stop only (a
+  memguard trip in the newest log archive, or a `glm53-spark` container that exited on its own); a deliberate
+  `./stop.sh` is left alone. `touch .state/watchdog.pause` pauses it. Run it as a systemd user service with
+  `ExecStart=<repo>/scripts/watchdog.sh` and `loginctl enable-linger`.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would
