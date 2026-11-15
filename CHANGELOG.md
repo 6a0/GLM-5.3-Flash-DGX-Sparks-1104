@@ -1,5 +1,16 @@
 # Changelog
 
+- **2026-11-15** -- Correction to the entry below, from live opencode traffic the same afternoon (5 agents, prompts
+  of 125-230K tokens, thinking on): with `TF_GLM_SNAP_SUB=1` and `TF_GLM_SHARED_COPY=16` both set, a decode round took
+  about 317 ms and a stream 10.8 tok/s (p50); with both unset, 149 ms and 18.8 tok/s at 4 running (the 121-patch
+  image's log gives 163 ms with 4 lanes busy). The two were not separated, the samples are small (47 and 18 requests)
+  and the concurrency differed by one, but both benchmarks behind them used ~20K-token conversations only. Leave both
+  off for long conversations until each is measured at 100K+. Also from that traffic: at `PARALLEL=16` the 7.3 GiB
+  prompt cache held 6-8 states of such conversations and evicted live ones (cold prefills of 105-125K tokens, 150-218 s
+  first tokens); `PARALLEL=8 CONTEXT=786432 PROMPT_CACHE_GIB=13` gives 3,074 pages and a 12.8 GiB cache. A kept
+  state's disk image is at least 458 MiB, so `--learn-daily-gib` (32) is spent in an hour of such traffic; the pair
+  now runs `SERVE_EXTRA_ARGS='--learn-daily-gib 128'` and `LEARN_GIB=60`.
+
 - **2026-11-15** -- Parallel agent sessions: `0123`-`0128` and a `local.sh` profile, measured on the pair with
   `docs/speed/harness/agentbench.py` (greedy, thinking off; "sessions" are N conversations over a shared 19K-token
   system block, five turns each, ~750 new tokens a turn, as last night's opencode log looks: prompts p50 102K, 95%
