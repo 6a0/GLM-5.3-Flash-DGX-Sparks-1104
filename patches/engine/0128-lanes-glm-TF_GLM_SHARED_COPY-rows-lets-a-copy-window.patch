@@ -1,0 +1,109 @@
+From 21708d5fdfb8d9574930957e1c8e5be2529241f8 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:14:43 +0000
+Subject: [PATCH 128/128] lanes, glm: TF_GLM_SHARED_COPY=<rows> lets a copy
+ window grow in shared rounds as a lone stream's does (off unless set)
+
+A context copy in a shared round was always the first copy's width (3 tokens here), and a stream's copy width
+grew only while it decoded alone: a file rewrite verifies up to 31 tokens a round at one stream and 4.0 tokens
+a round beside other streams (CHANGELOG 2026-11-11: 'shared rounds take almost no copies ... the next copy
+gain is there'). With TF_GLM_SHARED_COPY set (2..32 rows; Model.shared_copy_rows -> Config.shared_copy), a
+stream's copy width doubles on each fully landed copy and resets on a miss in shared rounds too, and a shared
+round's copy proposal takes that width up to the setting. The shared allocator already prices copy rows
+(copy_rate's chain, or the stream's own with TF_GLM_COPY_RATES=own) against the shared cost table and trims
+each window, and keeps the round within the shared forward's rows.
+
+Drafts only propose: every committed token is the target's own pick or draw, so replies are unchanged; rounds
+get longer for the streams beside a copying one, which is why it is a setting. Unset or 0: as before.
+Not compiled or run here (no toolchain on the serving host).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ zig/src/core/lanes/config.zig       | 3 +++
+ zig/src/core/lanes/engine.zig       | 2 +-
+ zig/src/core/lanes/windows.zig      | 4 +++-
+ zig/src/families/glm/cuda_lanes.zig | 9 +++++++++
+ 4 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index a6721fc..3507b59 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -47,6 +47,7 @@ pub const Model = struct {
+     context_copies: bool = false, // a lone head window shares its agreeing copy path and appends the rest
+     copy_match: i64 = 8, // matching history tokens a copy needs
+     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
++    shared_copy_rows: u32 = 0, // a shared round's copy window grows to these rows as copies land (0: the first copy's)
+ };
+ 
+ pub const Config = struct {
+@@ -94,6 +95,7 @@ pub const Config = struct {
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     lone_copies: bool = true, // Model.lone_copies
++    shared_copy: u32 = 0, // copied tokens a shared round's window grows to (Model.shared_copy_rows; 0: first_copy)
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -133,6 +135,7 @@ pub const Config = struct {
+             .context_copies = m.context_copies and m.copy_drafts,
+             .enter_match = @max(1, m.copy_match),
+             .lone_copies = m.lone_copies,
++            .shared_copy = if (m.shared_copy_rows > 1) @max(first_copy, @min(max_copy, m.shared_copy_rows - 1)) else 0,
+             .lone_cost_tile = m.lone_cost_tile,
+             .family_width = width,
+             .max_copy = max_copy,
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 5d357c6..3c61aad 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -345,7 +345,7 @@ pub const Engine = struct {
+                 const own: usize = own_end - 1;
+                 if (p.kind == .copy) {
+                     win.observeCopied(e, s, p.recalled, own_kept, own);
+-                    if (e.alone) {
++                    if (e.alone or e.cfg.shared_copy > 0) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+                         s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                     }
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index fd7ffec..4298f37 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -198,7 +198,9 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
+ /// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay.
+ pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
+     if (e.cfg.max_copy == 0 or s.force.items.len > 0 or (e.cfg.root_copies and s.root_copy_miss)) return .{};
+-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
++    // a shared round's copy stays the first copy's width unless cfg.shared_copy lets it grow as a lone stream's does
++    const grown = s.copy_width orelse e.cfg.first_copy;
++    const width: u32 = if (e.alone) grown else if (e.cfg.shared_copy > 0) @min(grown, e.cfg.shared_copy) else e.cfg.first_copy;
+     const most = @min(@as(i64, width), s.draftRoom() - 1);
+     if (s.proposer) |p| if (!e.alone or e.cfg.lone_copies) {
+         // a priced proposer's drafts are as it gives them, its none too: no width, length or match gate, no Recall
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 92d6a8f..50a8c89 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -137,9 +137,18 @@ pub const Lanes = struct {
+             .max_streams = if (sharing) engine.max_shared else 1,
+             .copy_match = copyMatch(),
+             .own_copy_rates = copyRates(),
++            .shared_copy_rows = if (sharing) sharedCopy() else 0,
+         };
+     }
+ 
++    /// TF_GLM_SHARED_COPY: the rows a copy window grows to in a shared round as its copies land, 2 to max_rows (unset
++    /// or 0: every shared round's copy stays the first copy's width, as before). The allocator still sizes each round.
++    fn sharedCopy() u32 {
++        const v = std.c.getenv("TF_GLM_SHARED_COPY") orelse return 0;
++        const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 0;
++        return @min(n, max_rows);
++    }
++
+     /// TF_GLM_COPY_MATCH: matching context tokens a copy needs before it takes a round's window (8, the core's).
+     fn copyMatch() i64 {
+         const v = std.c.getenv("TF_GLM_COPY_MATCH") orelse return 8;
+-- 
+2.43.0
+

@@ -1,0 +1,163 @@
+From 719065ed00da29a1cc69cf3f89a1dad8d5e66e22 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:14:43 +0000
+Subject: [PATCH 126/128] glm cuda: a shared round's keeps ride on its next
+ step together (TF_GLM_KEEP_RIDE=0: each alone, as before)
+
+Rank 0 keeps on every stream of a shared round before the round's block step. Only the last keep rode on that
+step (Link.keep_flag, same slot); each earlier one went out as its own step: a put launch and a broadcast on
+rank 0, a broadcast, a synchronize and a read on every other rank, a stream. Now the keeps rank 0 has not sent
+are held in order (Link.earlier) and the next verify, shared, block or draft step carries them all after its
+ids (Link.keeps_flag, the count in flags bits 26-30, each slot | rows << 16); the other ranks commit them in
+rank 0's order before the step, as each keep step did. Any other step, a full message, or a keep of 256 rows
+or more sends them alone first, in order, as before. One stream: the wire is unchanged.
+
+Same commits in the same order on every rank: no bits change. Not compiled or run here (no toolchain on the
+serving host).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ zig/glm_pages_host.zig               |  2 +
+ zig/src/families/glm/cuda_follow.zig | 58 +++++++++++++++++++++++++---
+ 2 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/zig/glm_pages_host.zig b/zig/glm_pages_host.zig
+index 69b2994..e2da39c 100644
+--- a/zig/glm_pages_host.zig
++++ b/zig/glm_pages_host.zig
+@@ -229,6 +229,7 @@ test "GLM pages: a failed begin packet cancels its lease and lane before a retry
+     link.ids = &.{};
+     link.asleep = false;
+     link.keep_pending = null;
++    link.earlier_n = 0;
+     var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
+     defer back.deinit();
+     var stream = try lanes.Stream.init(t.allocator, .{ .id = "page-test", .prompt = &.{100}, .max_new = 8 });
+@@ -256,6 +257,7 @@ test "GLM pages: a begin packet the link refuses leaves rank 0's pending keep fo
+     link.ids = &.{};
+     link.asleep = false;
+     link.keep_pending = .{ .slot = 0, .rows = 3 }; // committed on rank 0, not yet sent: it must not be sent or lost
++    link.earlier_n = 0;
+     const x: glm.follow.Leader = .{ .e = &f.e, .link = &link };
+     for (0..2) |_| {
+         try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }));
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 3b3170c..36a6591 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -45,6 +45,11 @@ pub const head_bytes = @sizeOf(Words);
+ /// ranks commit it before the step, as a separate keep step would have, without its round trip.
+ pub const keep_flag: u32 = 1 << 24;
+ 
++/// Header `flags` bit set when the step's last ids are keeps rank 0 has not sent yet (how many in bits 26-30), each
++/// `slot | rows << 16` in the order rank 0 made them: the other ranks commit them before the step, as each one's own
++/// keep step would have, without a round trip a stream (a shared round keeps on every stream before its block step).
++pub const keeps_flag: u32 = 1 << 25;
++
+ /// The most ids one step carries (a prompt at the engine's capacity).
+ pub const Link = struct {
+     d: *const cuda.Driver,
+@@ -57,6 +62,9 @@ pub const Link = struct {
+     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
+     asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
+     keep_pending: ?struct { slot: u32, rows: u32 } = null, // rank 0: a keep not yet sent (it rides on the next step)
++    earlier: [engine.max_shared]u32 = undefined, // rank 0: the keeps before it, not yet sent either (keeps_flag's words)
++    earlier_n: usize = 0,
++    ride: bool = true, // TF_GLM_KEEP_RIDE=0: only the last keep rides; each one before it goes alone, as before
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
+         const max_ids = @max(asked_ids, prompt_wire.words);
+@@ -66,7 +74,8 @@ pub const Link = struct {
+             owned.free();
+         }
+         const wait = if (std.c.getenv("TF_GLM_LINK_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+-        return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait };
++        const ride = if (std.c.getenv("TF_GLM_KEEP_RIDE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++        return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait, .ride = ride };
+     }
+ 
+     pub fn deinit(l: *Link) void {
+@@ -157,13 +166,31 @@ pub const Leader = struct {
+             x.link.asleep = false;
+         }
+         if (ids.len > x.link.ids.len) return error.TooManyIds; // refused whole: a pending keep stays for the next step
++        const kind: Kind = @fromBackingInt(@intCast(hh.kind));
++        var joined: [put_ids]u32 = undefined; // the step's ids, then the keeps it carries
++        var out = ids;
++        if (x.link.earlier_n > 0) { // several streams' keeps since the last step: all of them on this one, or each alone
++            const n = x.link.earlier_n;
++            x.link.earlier_n = 0;
++            const total = n + @intFromBool(x.link.keep_pending != null);
++            const carries = hh.flags & 0xffff_0000 == 0 and (kind == .verify or kind == .block or kind == .draft or kind == .shared);
++            if (carries and ids.len + total <= put_ids) {
++                @memcpy(joined[0..ids.len], ids);
++                @memcpy(joined[ids.len..][0..n], x.link.earlier[0..n]);
++                if (x.link.keep_pending) |kp| joined[ids.len + n] = kp.slot | (kp.rows << 16);
++                x.link.keep_pending = null;
++                out = joined[0 .. ids.len + total];
++                hh.flags |= keeps_flag | (@as(u32, @intCast(total)) << 26);
++            } else {
++                for (x.link.earlier[0..n]) |w| try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = w >> 16, .slot = w & 0xffff }, &.{});
++            }
++        }
+         if (x.link.keep_pending) |kp| {
+             x.link.keep_pending = null;
+-            const kind: Kind = @fromBackingInt(@intCast(hh.kind));
+             const rides = kp.slot == hh.slot and kp.rows < 256 and hh.flags & 0xffff_0000 == 0 and (kind == .verify or kind == .block or kind == .draft);
+             if (rides) hh.flags |= keep_flag | (kp.rows << 16) else try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
+         }
+-        try x.link.send(x.e.m.glue.put_words, hh, ids);
++        try x.link.send(x.e.m.glue.put_words, hh, out);
+     }
+ 
+     /// A prompt step's flags: 1 when its rows go through the head (the other ranks join each pass's broadcasts).
+@@ -328,9 +355,17 @@ pub const Leader = struct {
+     /// The other ranks hear the keep with rank 0's next step (Link.keep_flag), or alone before any other step.
+     pub fn keep(x: Leader, n: usize) !void {
+         try x.flush();
+-        if (x.link.keep_pending) |kp| { // two keeps in a row: the first goes alone
++        if (x.link.keep_pending) |kp| { // two keeps in a row: the first waits too (keeps_flag), or goes alone
+             x.link.keep_pending = null;
+-            try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
++            if (x.link.ride and n < 256 and kp.slot < 1 << 16 and x.link.earlier_n < x.link.earlier.len) {
++                x.link.earlier[x.link.earlier_n] = kp.slot | (kp.rows << 16);
++                x.link.earlier_n += 1;
++            } else {
++                const held = x.link.earlier_n;
++                x.link.earlier_n = 0;
++                for (x.link.earlier[0..held]) |w| try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = w >> 16, .slot = w & 0xffff }, &.{});
++                try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
++            }
+         }
+         if (n >= 256) try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{}) else x.link.keep_pending = .{ .slot = x.e.slot, .rows = @intCast(n) };
+         try x.e.keep(n);
+@@ -425,14 +460,25 @@ pub const Scratch = struct {
+ };
+ 
+ /// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
+-pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scratch) !bool {
++pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_all: []const u32, s: *Scratch) !bool {
+     var h = h_in;
++    var ids_in = ids_all;
+     const kind: Kind = @fromBackingInt(@intCast(h.kind));
+     if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
+         try e.bind(h.slot);
+         try e.keep((h.flags >> 16) & 0xff);
+         h.flags &= 0xffff;
+     }
++    if (h.flags & keeps_flag != 0) { // rank 0's keeps since its last step, each on its own slot, in rank 0's order
++        const n = (h.flags >> 26) & 0x1f;
++        if (n > ids_in.len) return error.BadStep;
++        for (ids_in[ids_in.len - n ..]) |w| {
++            try e.bind(w & 0xffff);
++            try e.keep(w >> 16);
++        }
++        ids_in = ids_in[0 .. ids_in.len - n];
++        h.flags &= 0xffff;
++    }
+     if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout) try e.bind(h.slot);
+     e.prompt_logprobs = if (promptRows(h)) .{} else null;
+     e.structured = structuredStep(h); // rank 0 alone masks them
+-- 
+2.43.0
+

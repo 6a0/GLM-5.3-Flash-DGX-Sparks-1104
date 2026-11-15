@@ -1,0 +1,313 @@
+From a6e5045fd9a7f08582c76067839c55db95f07f38 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:14:43 +0000
+Subject: [PATCH 125/128] glm cuda: TF_GLM_SNAP_SUB=1: prompt states kept and
+ resumed on TF_GLM_CHUNK rows (EXPERIMENTAL, not built or run)
+
+Kept prompt states sit on the 4,096-row chunk grid (cuda_native.snap_grid), so every turn of a conversation prefills
+up to 4,095 trailing tokens again. Measured on this pair's own log (706 single-stream turns of an agent loop,
+2026-11-14): TTFT = 0.39-0.52 s + 0.73-0.79 ms a re-prefilled token, a mean tail of ~2,050 tokens beyond the turn's
+new ones, i.e. ~1.5 s of every turn's first token and of GPU time the other streams wait through.
+
+0110 (TF_GLM_CHUNK_SOLO) already takes a chunk in busy steps of TF_GLM_CHUNK rows with every state byte equal to the
+whole chunk's (glm-solo-check), a busy step commits its rows as a chunk does, and the index rings rebase only at a
+chunk's start (prompt_solo.ringsAgree), so the state a pass stands at after a busy step is the one every pass has
+there. With TF_GLM_SNAP_SUB=1 (needs TF_GLM_CHUNK_SOLO=4096; TF_GLM_CHUNK=1024 for the finest grid) rank 0:
+
+- plans the cache's marks on TF_GLM_CHUNK rows (cuda_native.snapGrid -> native/cuda_snaps cacheRules), and resumes
+  kept states there (cuda_lanes.resumeFrom);
+- takes busy steps where a mark lies inside the chunk, so a step starts at the mark and Engine.prefillChunk keeps the
+  state there, and to finish a chunk begun in busy steps (prompt_solo.busyAt, as before); a pair never passes a mark;
+- no longer takes busy steps merely beside a decoding stream (that behaviour of TF_GLM_CHUNK_SOLO alone was measured
+  as no gain here, RESULTS.md 0110), so a chunk without a mark in it goes whole as today;
+- runs a whole pass (a warm turn, TF_GLM_PROMPT_STEPS=0) as its steps, since Engine.prefill's chunk loop on every
+  rank takes whole chunks only.
+Every rank accepts a resume on TF_GLM_CHUNK rows once busy steps are on (Engine.prefillStart, prompt_solo.stepGrid):
+the fingerprint already carries the chunk words, so no rank can disagree and its layout is unchanged. Off with image
+rows (a busy step takes none) and TF_GLM_KV_SHARD. Unset: every path is as before (subOn false: markWithin false,
+snapGrid and the store's grid 4,096; stepGrid is 4,096 unless TF_GLM_CHUNK_SOLO is set).
+
+Cost to weigh: each prompt step has a fixed part (about 0.3 s here), so a tail takes ceil(rows / TF_GLM_CHUNK) steps
+where it took one, and states are kept about four times as often (a device copy of the whole state each, and a disk
+write with --learn-conversations).
+
+NOT COMPILED OR RUN (no toolchain on the host it was written on). Before use: build, cuda_prompt_solo's unit test,
+then on the pair a glm-solo-check style twin (a prompt resumed from a state kept part way into a chunk against the
+same prompt cold: first token, next window's logits, ring bases, state bytes), greedy hashes, and the cold/warm
+replay with cached counts.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ zig/src/families/glm/cuda_engine.zig       |  5 ++-
+ zig/src/families/glm/cuda_engine_types.zig |  3 +-
+ zig/src/families/glm/cuda_follow.zig       |  9 +++-
+ zig/src/families/glm/cuda_lanes.zig        | 24 +++++++++--
+ zig/src/families/glm/cuda_native.zig       |  8 ++++
+ zig/src/families/glm/cuda_prompt_solo.zig  | 48 ++++++++++++++++++++++
+ zig/src/families/glm/cuda_ranks.zig        | 15 +++++++
+ zig/src/native/cuda_snaps.zig              |  4 +-
+ 8 files changed, 105 insertions(+), 11 deletions(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 53764bf..6235744 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -239,7 +239,8 @@ pub const Engine = struct {
+         }
+         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+         errdefer e.bp.deinit();
+-        if (o.settings.chunk != 0 and rank == 0) std.log.info("glm: prompt steps of {d} rows while another stream decodes, {d} alone (TF_GLM_CHUNK_SOLO); kept states stay on the {d}-row grid", .{ o.settings.chunk, fw.prefill_rows, fw.prefill_rows });
++        if (o.settings.chunk != 0 and rank == 0 and !o.settings.snap_sub) std.log.info("glm: prompt steps of {d} rows while another stream decodes, {d} alone (TF_GLM_CHUNK_SOLO); kept states stay on the {d}-row grid", .{ o.settings.chunk, fw.prefill_rows, fw.prefill_rows });
++        if (o.settings.snap_sub and rank == 0) std.log.info("glm: TF_GLM_SNAP_SUB asks kept prompt states on {d} rows (prompt steps of {d} rows toward a state inside a chunk, whole {d}-row chunks otherwise); off with image rows or TF_GLM_KV_SHARD", .{ o.settings.chunk, o.settings.chunk, fw.prefill_rows });
+         try e.initNumerics();
+         errdefer if (e.a8_buf) |*b| b.free();
+         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity, !o.settings.split); // split: one room
+@@ -497,7 +498,7 @@ pub const Engine = struct {
+     fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
+         if (!promptFits(len, e.cur.st.capacity)) return error.PromptTooLong;
+         const r = from orelse return 0;
+-        if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
++        if (r.at == 0 or r.at >= len or r.at % prompt_solo.stepGrid(e) != 0) return error.BadResume; // off the chunk grid: finished in busy steps
+         try e.restoreState(r.id); // DFlash2's context too: its kept rows, or from r.at when it kept none
+         return r.at;
+     }
+diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/cuda_engine_types.zig
+index 1b9c19a..39c26db 100644
+--- a/zig/src/families/glm/cuda_engine_types.zig
++++ b/zig/src/families/glm/cuda_engine_types.zig
+@@ -29,7 +29,8 @@ pub const Snap = struct {
+     home: ?u8 = null, // TF_GLM_KV_SHARD: the part its stream lay in; that rank's copy alone holds the latent rows
+ };
+ 
+-/// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
++/// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows (of a busy
++/// step's rows under TF_GLM_SNAP_SUB: cuda_prompt_solo.stepGrid).
+ pub const Resume = struct { id: u64, at: usize };
+ 
+ /// Rank 0's marks in a prompt pass: `call` may keep the state at a chunk start; other ranks copy at that chunk's gate.
+diff --git a/zig/src/families/glm/cuda_follow.zig b/zig/src/families/glm/cuda_follow.zig
+index 3cbd0e6..3b3170c 100644
+--- a/zig/src/families/glm/cuda_follow.zig
++++ b/zig/src/families/glm/cuda_follow.zig
+@@ -263,8 +263,13 @@ pub const Leader = struct {
+     pub fn chunk(x: Leader, ids: []const u32, start: usize, solo: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
+         if (start >= ids.len) return error.BadChunk;
+         try x.flush();
+-        const busy = prompt_solo.busyAt(x.e, start, ids.len, solo, from);
+-        const n: usize = if (busy) x.e.settings.chunk else if (solo and x.e.pairedAt(start, ids.len, from, marks)) 2 * engine.prompt_rows else engine.prompt_rows;
++        // TF_GLM_SNAP_SUB (prompt_solo.subOn): busy steps lead to a mark inside the chunk and finish a chunk begun in
++        // them, whatever the lanes say, and a pair never passes a mark; unset, `markWithin` is false and nothing changes
++        const at: []const u32 = if (marks) |m| m.at else &.{};
++        const next = prompt_solo.chunkAt(start) + engine.prompt_rows;
++        const alone = if (prompt_solo.subOn(x.e)) !prompt_solo.markWithin(x.e, at, start, next) else solo;
++        const busy = prompt_solo.busyAt(x.e, start, ids.len, alone, from);
++        const n: usize = if (busy) x.e.settings.chunk else if (solo and !prompt_solo.markWithin(x.e, at, start, next + engine.prompt_rows) and x.e.pairedAt(start, ids.len, from, marks)) 2 * engine.prompt_rows else engine.prompt_rows;
+         const part = ids[start..@min(ids.len, start + n + 1)];
+         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
+         try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intFromBool(busy)) << 2, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+diff --git a/zig/src/families/glm/cuda_lanes.zig b/zig/src/families/glm/cuda_lanes.zig
+index 95c0dcd..92d6a8f 100644
+--- a/zig/src/families/glm/cuda_lanes.zig
++++ b/zig/src/families/glm/cuda_lanes.zig
+@@ -9,6 +9,7 @@ const dflash = @import("dflash.zig");
+ const prompt_lp = @import("cuda_prompt_logprobs.zig");
+ const cuda = @import("cuda");
+ const rule = @import("draft_rule.zig");
++const prompt_solo = @import("cuda_prompt_solo.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -228,10 +229,24 @@ pub const Lanes = struct {
+         try sink.prepare();
+         self.x.e.prompt_logprobs = sink.want();
+         defer self.x.e.prompt_logprobs = null;
+-        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
++        // TF_GLM_SNAP_SUB: a whole pass goes as its steps, since a state off the chunk grid resumes in busy steps and the
++        // whole pass's chunk loop (Engine.prefill, on every rank) takes whole chunks alone
++        const first = if (prompt_solo.subOn(self.x.e)) try self.stepped(s, from) else try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+         self.lanes.getPtr(s).?.first = self.take(first);
+     }
+ 
++    /// A whole prompt pass as prefillStepFn's steps, back to back: the first token.
++    fn stepped(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !u32 {
++        var at: usize = if (from) |r| r.at else 0;
++        var resumed = from;
++        while (true) {
++            const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), resumed, .{ .ptr = s, .check = cancelled }, marksOf(s));
++            if (step.first) |first| return first;
++            at += step.rows;
++            resumed = null; // restored at the first step
++        }
++    }
++
+     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+         const self = of(ptr);
+         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
+@@ -385,13 +400,14 @@ pub const Lanes = struct {
+         };
+     }
+ 
+-    /// The stream's kept state, where its prompt pass starts (null: none, off the chunk grid, or no longer held).
++    /// The stream's kept state, where its prompt pass starts (null: none, off the grid states sit on, or no longer held).
+     fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
+         const saved = s.reuse.saved orelse return null;
+         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
+-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) {
++        const grid = prompt_solo.snapGrid(self.x.e); // the chunk grid, or TF_GLM_CHUNK rows under TF_GLM_SNAP_SUB
++        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % grid != 0 or !self.x.e.holds(k.id)) {
+             s.reuse_failed = true;
+-            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
++            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % grid != 0) error.SnapshotOutOfStep else error.SnapshotStale;
+             return null;
+         }
+         if (!self.resumesHere(k.id)) { // sharded: the stream lies outside the state's home part and carries are off
+diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_native.zig
+index c9238a1..4da71db 100644
+--- a/zig/src/families/glm/cuda_native.zig
++++ b/zig/src/families/glm/cuda_native.zig
+@@ -24,6 +24,13 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = fw.prefill_rows;
+ /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
+ pub const snap_grid: u32 = prompt_rows;
++/// The rows the prompt cache plans its marks on (native/cuda_snaps.cacheRules reads it after `open`): `snap_grid`, or
++/// under TF_GLM_SNAP_SUB the busy step's rows (cuda_prompt_solo.snapGrid), which rank 0's `openRank` puts here.
++var snap_rows: u32 = snap_grid;
++
++pub fn snapGrid() u32 {
++    return snap_rows;
++}
+ /// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
+ /// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
+ /// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
+@@ -329,6 +336,7 @@ fn finishRank(a: OpenArgs) !Loaded {
+         }
+     }.get;
+     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
++    snap_rows = @intCast(@import("cuda_prompt_solo.zig").snapGrid(own.e)); // the cache's marks, where the lanes resume
+     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
+     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
+     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
+diff --git a/zig/src/families/glm/cuda_prompt_solo.zig b/zig/src/families/glm/cuda_prompt_solo.zig
+index ca13efb..3708ead 100644
+--- a/zig/src/families/glm/cuda_prompt_solo.zig
++++ b/zig/src/families/glm/cuda_prompt_solo.zig
+@@ -47,6 +47,36 @@ pub fn rowsAt(start: usize, len: usize, busy: usize) usize {
+     return @min(len - start, busy);
+ }
+ 
++/// The rows a kept state may resume on, on every rank: the chunk grid, or with busy steps on a busy step's rows, where
++/// a chunk begun in busy steps is finished in them (`busyAt`, `allowed`). Rank 0 resumes there only under `subOn`.
++pub fn stepGrid(e: *const Engine) usize {
++    return if (e.settings.chunk != 0) e.settings.chunk else fw.prefill_rows;
++}
++
++/// TF_GLM_SNAP_SUB=1, rank 0's word: prompt states are kept and resumed on TF_GLM_CHUNK rows, not only on the chunk
++/// grid, so a later turn prefills at most TF_GLM_CHUNK - 1 rows again instead of 4,095. A row's result does not depend
++/// on which pass holds it (this file's note; glm-solo-check's busy twins), a busy step ends with its rows committed as
++/// a chunk does, and the index rings rebase only at a chunk's start (`ringsAgree`), so the state a pass stands at
++/// after a busy step is the state every pass has there. Busy steps then run where a mark lies inside the chunk and to
++/// finish a chunk begun in them, and no longer beside a decoding stream (`Leader.chunk`). Not with image rows (a busy
++/// step takes none) or TF_GLM_KV_SHARD (its kept states' homes are not checked off the grid).
++pub fn subOn(e: *const Engine) bool {
++    return e.settings.snap_sub and e.settings.chunk != 0 and !e.settings.kv_shard.on and e.images == null;
++}
++
++/// The rows rank 0 keeps and resumes prompt states on: the chunk grid, or under `subOn` a busy step's rows.
++pub fn snapGrid(e: *const Engine) usize {
++    return if (subOn(e)) e.settings.chunk else fw.prefill_rows;
++}
++
++/// Whether one of a pass's marks lies inside (`lo`, `hi`) under `subOn`: a step from `lo` to `hi` would pass the mark
++/// without standing at it, and a state is kept only where a step starts (Engine.prefillChunk).
++pub fn markWithin(e: *const Engine, marks: []const u32, lo: usize, hi: usize) bool {
++    if (!subOn(e)) return false;
++    for (marks) |m| if (m > lo and m < hi) return true;
++    return false;
++}
++
+ /// Rank 0's choice for the step at `start` (the others take the ids it sends and the chunk's flag 4): a busy step when
+ /// the setting is on, another stream decodes (`solo` false) and nothing reads a chunk's rows. Off the chunk grid the
+ /// step is a busy one whatever `solo`: a chunk split into busy steps is finished in them, as no whole chunk starts there.
+@@ -133,6 +163,24 @@ test "the MTP head's pass over a step's next ids: the step's rows in one unset,
+     try std.testing.expectEqual(@as(usize, 1024), mtpPiece(&e, 3000));
+ }
+ 
++test "TF_GLM_SNAP_SUB: kept states on the busy step's rows, and a mark inside a step's reach is seen" {
++    var e: Engine = undefined;
++    e.settings = .{};
++    e.images = null;
++    try std.testing.expectEqual(@as(usize, fw.prefill_rows), stepGrid(&e));
++    try std.testing.expectEqual(@as(usize, fw.prefill_rows), snapGrid(&e));
++    e.settings.chunk = 1024;
++    try std.testing.expectEqual(@as(usize, 1024), stepGrid(&e)); // every rank resumes there once busy steps are on
++    try std.testing.expectEqual(@as(usize, fw.prefill_rows), snapGrid(&e)); // rank 0 keeps none there unasked
++    try std.testing.expect(!markWithin(&e, &.{5120}, 4096, 8192));
++    e.settings.snap_sub = true;
++    try std.testing.expectEqual(@as(usize, 1024), snapGrid(&e));
++    try std.testing.expect(markWithin(&e, &.{5120}, 4096, 8192));
++    try std.testing.expect(!markWithin(&e, &.{ 4096, 8192 }, 4096, 8192)); // a mark at either end is a step's start
++    e.settings.kv_shard.on = true;
++    try std.testing.expectEqual(@as(usize, fw.prefill_rows), snapGrid(&e));
++}
++
+ test "TF_GLM_CHUNK takes a divisor of the chunk: 2048 or 1024" {
+     for (choices) |c| {
+         try std.testing.expect(valid(c));
+diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ranks.zig
+index ef55827..88fa49d 100644
+--- a/zig/src/families/glm/cuda_ranks.zig
++++ b/zig/src/families/glm/cuda_ranks.zig
+@@ -19,6 +19,7 @@ pub const Settings = struct {
+     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
+     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+     chunk: u32 = 0, // TF_GLM_CHUNK_SOLO=4096: a prompt step beside a decoding stream takes this many rows of a chunk (TF_GLM_CHUNK: 2048 or 1024; 0: the whole chunk, off)
++    snap_sub: bool = false, // TF_GLM_SNAP_SUB=1 (with TF_GLM_CHUNK_SOLO=4096): rank 0 keeps and resumes prompt states on `chunk` rows, in busy steps (cuda_prompt_solo.subOn)
+     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
+     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
+     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
+@@ -84,6 +85,20 @@ pub const Settings = struct {
+             }
+             s.chunk = rows;
+         }
++        // Kept prompt states on the busy step's rows (cuda_prompt_solo.subOn). Rank 0 alone acts on it: the other ranks
++        // take its busy steps by the chunk header's flag 4 and resume on TF_GLM_CHUNK rows whenever busy steps are on.
++        if (get("TF_GLM_SNAP_SUB")) |v| {
++            if (std.mem.eql(u8, v, "1")) {
++                if (s.chunk == 0) {
++                    problem.* = "TF_GLM_SNAP_SUB=1 needs TF_GLM_CHUNK_SOLO=4096 (kept prompt states then sit on TF_GLM_CHUNK rows)";
++                    return error.BadSetting;
++                }
++                s.snap_sub = true;
++            } else if (!std.mem.eql(u8, v, "0")) {
++                problem.* = "TF_GLM_SNAP_SUB: 0 or 1";
++                return error.BadSetting;
++            }
++        }
+         s.l2pf = try l2pf.Options.read(get, problem);
+         if (get("TF_GLM_OVERLAP_PIECES")) |v| {
+             s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index 113270f..2377a16 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ const api = @import("engine_api");
+ 
+-/// Any row, the head one token on (Nemotron's); a family's snap_grid, snap_lookahead, warm_quiet and snap_fork if set.
++/// Any row, the head one token on (Nemotron's); a family's snap_grid (snapGrid), snap_lookahead, warm_quiet and snap_fork if set.
+ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
+     if (@hasDecl(F, "snap_lookahead")) rules.lookahead = F.snap_lookahead;
+@@ -10,7 +10,7 @@ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+     if (@hasDecl(F, "snap_fork")) rules.fork = F.snap_fork; // opt-in, a family at a time after its device check
+     if (@hasDecl(F, "snap_grid")) {
+         rules.planned = true;
+-        rules.grid = F.snap_grid;
++        rules.grid = if (@hasDecl(F, "snapGrid")) F.snapGrid() else F.snap_grid; // a grid the family settles at its open (GLM's TF_GLM_SNAP_SUB)
+     }
+     return rules;
+ }
+-- 
+2.43.0
+

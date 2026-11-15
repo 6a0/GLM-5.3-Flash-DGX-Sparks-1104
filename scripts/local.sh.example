@@ -37,3 +37,14 @@ HOST_CACHE_GIB=0              # the pinned host prompt tier is the same memory a
 # Keep downloads, the drafter and the engine's digest cache outside the checkout:
 # DATA_DIR=/mnt/models/glm53
 # TENSORFOLD_API_KEY and HF_TOKEN may be exported; never commit them.
+
+# --- many parallel agent sessions (CHANGELOG 2026-11-15; measured on the pair) ----------------------------------------
+# PARALLEL=16                 # a shared decode round takes up to 16 streams; 291 MiB fixed for each
+# HEAD=q8
+# L2PF=1
+# PROMPT_CACHE_GIB=10         # funded after the streams' fixed parts: 9.6 GiB at 8 streams, 7.3 at 16
+# MEMORY_RESERVE_GIB=7.5
+# export TENSORFOLD_RESTORE_PREFETCH=1 TENSORFOLD_RESTORE_PREFETCH_GIB=4   # bound the host memory of disk read-ahead
+# export TF_QUEUE_KEEPS=1                                            # 0124
+# export TF_GLM_SNAP_SUB=1 TF_GLM_CHUNK_SOLO=4096 TF_GLM_CHUNK=1024  # 0125: prompt states on a 1,024-row grid
+# export TF_GLM_SHARED_COPY=16                                       # 0128

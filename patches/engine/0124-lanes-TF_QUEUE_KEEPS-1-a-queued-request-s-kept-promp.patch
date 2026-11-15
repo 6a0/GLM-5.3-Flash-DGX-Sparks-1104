@@ -1,0 +1,111 @@
+From e7ce2e80075b1d3892a25403680d149285aaee93 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:14:43 +0000
+Subject: [PATCH 124/128] lanes: TF_QUEUE_KEEPS=1: a queued request's kept
+ prompt state counts as used while it waits
+
+The prompt cache frees its least recently used state first (prompt_cache_policy.victimBut), and a state's use is
+marked only where its request is admitted (Store.resumedWithReason) or kept. Behind a backlog (--parallel lanes all
+busy) the conversation that has waited longest therefore holds the oldest state: a running pass's keep or the next
+admission's reserve frees the very state a queued request was about to resume, and that request prefills its whole
+conversation again beside the decoding streams.
+
+With TF_QUEUE_KEEPS=1 the engine thread marks each queued foreground request's kept state used once, when admission
+first sees it wait (lane_host_admit.pick, beside the disk read-ahead), so the state outlives the wait and the
+eviction falls on a conversation with no request pending. Unset: nothing changes. Replies are the same either way;
+only the order states are freed in changes.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ zig/src/core/lane_host.zig       |  3 ++-
+ zig/src/core/lane_host_admit.zig | 28 ++++++++++++++++++++++++++++
+ zig/src/core/lane_job.zig        |  1 +
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 048f187..b2fdbc5 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -82,6 +82,7 @@ pub const LaneHost = struct {
+     pieces: std.ArrayList(Rounds.Piece) = .empty,
+     share: fill.Share = .{}, // prompt work's share of wall time beside decoding streams (lane_host_fill.zig)
+     prefix: @import("lane_host_prefix.zig").Wait = .{}, // a request's wait for a cut another prompt is filling
++    keep_queued: bool = false, // TF_QUEUE_KEEPS=1: a queued request's kept state counts as used while it waits (lane_host_admit.zig)
+     finals: std.ArrayList(usize) = .empty,
+     pressure: ?@import("memory_pressure.zig").Governor = null, // macOS memory pressure (lane_host_pressure.zig); null: off
+ 
+@@ -94,7 +95,7 @@ pub const LaneHost = struct {
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var shown = info_.ofLanes();
+         shown.draft_sources = shown.draft_sources.ofLanes(core.cfg, shown.lanes);
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .fromEnv(), .prefix = .fromEnv(), .pressure = .fromEnv() };
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .fromEnv(), .prefix = .fromEnv(), .keep_queued = admit.keepsQueued(), .pressure = .fromEnv() };
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+diff --git a/zig/src/core/lane_host_admit.zig b/zig/src/core/lane_host_admit.zig
+index 67e527c..71a246c 100644
+--- a/zig/src/core/lane_host_admit.zig
++++ b/zig/src/core/lane_host_admit.zig
+@@ -1,4 +1,5 @@
+ //! Which queued request a lane host admits next: the head, or one behind a head that waits for pool room.
++const std = @import("std");
+ const api = @import("engine_api.zig");
+ const LaneHost = @import("lane_host.zig").LaneHost;
+ const Job = LaneHost.Job;
+@@ -11,6 +12,7 @@ const pressure = @import("lane_host_pressure.zig");
+ pub fn pick(h: *LaneHost) ?usize {
+     if (pressure.holds(h)) return null; // under memory pressure nothing starts or is read ahead
+     if (!h.stale) fetch.queue(h); // disk states read ahead for queued requests, a lane free or not
++    if (h.keep_queued and !h.stale) touch(h); // and their kept states marked used, so a running pass's keep evicts another's
+     // a stale device takes no reply: `learn.refuse` ends the queued ones instead
+     if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes)) return null;
+     prefix.release(h); // requests whose awaited cut is in (or will not come) go on first
+@@ -20,6 +22,32 @@ pub fn pick(h: *LaneHost) ?usize {
+     }
+ }
+ 
++/// TF_QUEUE_KEEPS=1 (unset or anything else: off, as before): whether queued requests mark their kept states used.
++pub fn keepsQueued() bool {
++    const v = std.c.getenv("TF_QUEUE_KEEPS") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// Each queued request's kept state marked used, once, when the engine thread first sees it wait (the lock held).
++/// The cache frees its least recently used state first, and a state is otherwise marked only where its request is
++/// admitted: behind a backlog the conversation that has waited longest holds the oldest state, so a running pass's
++/// keep freed the very state the next admission was about to resume, and that request prefilled its conversation
++/// again. Marked here, the state outlives the wait and the keep takes an idle conversation's instead. Replies are
++/// the same either way: only which state goes first changes. Warm passes mark nothing (their turn may never come).
++fn touch(h: *LaneHost) void {
++    const store = h.cache orelse return;
++    for (h.queued.items) |job| {
++        if (job.touched) continue;
++        job.touched = true;
++        const r = job.request;
++        // keyed as `lane_stream.open` looks a request up: by its tokens alone (an image request's key takes its frame there)
++        if (r.background or r.embedding != null or r.prompt_logprobs != null or r.untaught or r.images.len > 0 or r.cacheKey().len == 0) continue;
++        const e = store.find(r.cacheKey(), r.chunks, h.spans(r)) orelse continue;
++        store.clock += 1;
++        e.used = store.clock;
++    }
++}
++
+ /// Whether queued `job` is passed over: it waits for another fill's cut or for its disk state's read.
+ fn passed(h: *LaneHost, job: *const Job) bool {
+     return prefix.waiting(job) or fetch.held(h, job);
+diff --git a/zig/src/core/lane_job.zig b/zig/src/core/lane_job.zig
+index 15a7540..f9a1f84 100644
+--- a/zig/src/core/lane_job.zig
++++ b/zig/src/core/lane_job.zig
+@@ -39,6 +39,7 @@ pub const Job = struct {
+     reached: u32 = 0, // the furthest mark its prompt pass has stood at, kept or not
+     prefix: @import("lane_host_prefix.zig").Waiting = .{}, // its wait for another fill's cut, while queued
+     fetch: @import("lane_host_fetch.zig").Ticket = .{}, // its disk state read ahead, while queued
++    touched: bool = false, // TF_QUEUE_KEEPS: its kept state was marked used while it queued (lane_host_admit.zig)
+ 
+     /// Record first admission once, including a family planner and a background pass that later yields.
+     pub fn noteAdmission(job: *Job) void {
+-- 
+2.43.0
+

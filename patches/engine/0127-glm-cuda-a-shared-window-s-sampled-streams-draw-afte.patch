@@ -1,0 +1,118 @@
+From 252faada3a63feb539d99bd30e70faeb64f2f3e7 Mon Sep 17 00:00:00 2001
+From: 6a0 <87043474+6a0@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:14:43 +0000
+Subject: [PATCH 127/128] glm cuda: a shared window's sampled streams draw
+ after one gather and one sync (TF_GLM_DRAW_BATCH=0: each alone)
+
+A shared verify window whose streams all decode greedily takes one pick launch, one gather, one sync and one
+read. With a sampled stream in it (temperature over 0: served traffic) every part ran Engine.draw on its own:
+its rows copied whole, a group of NCCL broadcasts, two uploads, tf_draw, a synchronize and a read, a stream,
+one after the other behind the forward. Now, when every part is sampled and no grammar is in the step, all the
+window's rows go whole in one gather (one group), each part's tf_draw launches on its rows of that buffer under
+its own rule and positions (Sampler.drawParts), and one synchronize and one read end the step; the other ranks
+join the one gather as they joined each part's. A step with a grammar or a greedy stream beside sampled ones
+draws as before.
+
+The same kernel on the same rows with the same rule and position keys: the same tokens. Not compiled or run
+here (no toolchain on the serving host).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ zig/src/families/glm/cuda_engine.zig  | 23 ++++++++++++++++++-
+ zig/src/families/glm/cuda_sampler.zig | 32 +++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_engine.zig
+index 6235744..84a769b 100644
+--- a/zig/src/families/glm/cuda_engine.zig
++++ b/zig/src/families/glm/cuda_engine.zig
+@@ -103,6 +103,7 @@ pub const Engine = struct {
+     pieces: fw.Pieces,
+     discard_draws: bool = false, // a follower's verify step: its draws join the gathers, rank 0 alone reads the tokens
+     moe_fuse: bool = true, // TF_GLM_MOE_FUSE=0: a decode window's EXL3 MoE glue unfused (the same bits either way)
++    draw_batch: bool = true, // TF_GLM_DRAW_BATCH=0: a shared window's sampled streams each draw alone (the same tokens)
+     side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
+     w: weights.Weights,
+     bp: fw.Buffers, // prompt chunks
+@@ -198,7 +199,7 @@ pub const Engine = struct {
+         for (layers, 0..) |*l, i| l.* = @intCast(i);
+         const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
+         if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
+-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
++        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .draw_batch = envOn("TF_GLM_DRAW_BATCH"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
+         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+         const Tile = struct {
+@@ -709,6 +710,26 @@ pub const Engine = struct {
+             for (parts, segs[0..parts.len]) |p, g| @memcpy(p.out[0..g.rows], outs[g.row0..][0..g.rows]);
+             return;
+         }
++        // every part sampled, no grammar (the same on every rank): all rows whole in one gather (one group of the
++        // ranks' broadcasts), a draw launch a part under its own rule and positions, then one sync and one read, each
++        // row's token as its part's own draw gives it (TF_GLM_DRAW_BATCH=0: a gather, a draw and a sync a part)
++        var all_sampled = e.draw_batch and !e.structured and rows <= e.smp.rows;
++        for (parts) |p| all_sampled = all_sampled and e.seqs.items[p.slot].?.sampling != null;
++        if (all_sampled) {
++            var draws: [max_shared]sampler.Sampler.Part = undefined;
++            for (parts, segs[0..parts.len], draws[0..parts.len]) |p, g, *d| {
++                try e.bind(p.slot);
++                e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
++                d.* = .{ .row0 = g.row0, .rows = g.rows, .first = g.st.pos + 1, .rule = sampler.rule(e.cur.sampling.?), .out = p.out };
++            }
++            try e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = b.logits }}, rows, e.smp.full.ptr);
++            if (e.discard_draws) { // a follower's rows: their columns to every rank, the draws rank 0's
++                for (parts) |p| @memset(p.out, 0);
++                return;
++            }
++            try e.smp.drawParts(e.stream, draws[0..parts.len]);
++            return e.checkGathers(); // the draws read rows the forward's gathers made
++        }
+         for (parts, segs[0..parts.len]) |p, g| {
+             try e.bind(p.slot);
+             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+diff --git a/zig/src/families/glm/cuda_sampler.zig b/zig/src/families/glm/cuda_sampler.zig
+index c8f1e33..bf2aa74 100644
+--- a/zig/src/families/glm/cuda_sampler.zig
++++ b/zig/src/families/glm/cuda_sampler.zig
+@@ -92,6 +92,38 @@ pub const Sampler = struct {
+         try s.tok.download(0, std.mem.sliceAsBytes(out[0..rows]));
+     }
+ 
++    /// One stream's rows of a shared step's whole rows (drawParts): `rows` of them from row `row0` of `full`.
++    pub const Part = struct { row0: usize, rows: usize, first: u64, rule: Rule, out: []u32 };
++
++    /// Several streams' whole rows already in `full` -> each part's `out` under its own rule, as `drawFull` draws each
++    /// part alone (the same kernel on the same rows, keyed by the same positions): a launch a part, its rule and meta
++    /// uploaded ahead of it in stream order, then one sync and one read for them all.
++    pub fn drawParts(s: *Sampler, stream: cuda.Stream, parts: []const Part) !void {
++        const V = s.vocab;
++        var toks: [64]u32 = undefined;
++        var total: usize = 0;
++        for (parts) |p| {
++            if (p.rows == 0 or p.row0 + p.rows > s.rows or p.row0 + p.rows > toks.len or p.out.len < p.rows or p.first < 1) return error.WindowTooWide;
++            const r = p.rule;
++            try s.rule.uploadAsync(0, std.mem.asBytes(&r), stream.handle);
++            const meta = [4]i32{ @intCast(p.first - 1), 0, 0, 0 }; // row r keys meta[0] + r + 1
++            try s.meta.uploadAsync(0, std.mem.asBytes(&meta), stream.handle);
++            var args: cuda.Args = .{};
++            args.add(s.full.ptr + p.row0 * V * 2);
++            args.add(@as(u32, @intCast(V)));
++            args.add(s.rule.ptr);
++            args.add(s.meta.ptr);
++            args.add(@as(i32, 0));
++            args.add(s.tok.ptr + p.row0 * 4);
++            args.add(s.prob.ptr + p.row0 * 4);
++            try cuda.launch.launch(s.tf_draw, .{ .grid = .{ .x = @intCast(p.rows) }, .block = .{ .x = 1024 } }, stream, &args);
++            total = @max(total, p.row0 + p.rows);
++        }
++        try stream.synchronize();
++        try s.tok.download(0, std.mem.sliceAsBytes(toks[0..total]));
++        for (parts) |p| @memcpy(p.out[0..p.rows], toks[p.row0..][0..p.rows]);
++    }
++
+     /// `rows` rows of `mine` made whole in `full` (bf16 [rows][vocab]) on every rank, each column from its rank.
+     pub fn gather(s: *const Sampler, stream: cuda.Stream, exchange: Exchange, spans: []const Span, mine: []const Local, rows: usize, full: u64) !void {
+         const V = s.vocab;
+-- 
+2.43.0
+

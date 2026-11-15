@@ -1,5 +1,30 @@
 # Changelog
 
+- **2026-11-15** -- Parallel agent sessions: `0123`-`0128` and a `local.sh` profile, measured on the pair with
+  `docs/speed/harness/agentbench.py` (greedy, thinking off; "sessions" are N conversations over a shared 19K-token
+  system block, five turns each, ~750 new tokens a turn, as last night's opencode log looks: prompts p50 102K, 95%
+  cached, most per-turn prefill being the 4,096-row resume grid rather than new content).
+  - `0125` `TF_GLM_SNAP_SUB=1` (with `TF_GLM_CHUNK_SOLO=4096 TF_GLM_CHUNK=1024`): prompt states are kept and resumed on
+    a 1,024-row grid. Eight sessions: 182.6 s -> 122.8 s wall (33.9 -> 50.3 output tok/s), cached share 84.6% -> 94.7%,
+    worst follow-up TTFT 29-57 s -> 12 s. Replies byte-identical on against off over 61 requests (48 sub-grid resumes),
+    and again for a sub-grid state restored from the `LEARN_GIB` store after restarts (1.2 s against 12 s cold). The
+    patch's own message still says "not compiled or run": it is now both. States are kept about four times as often,
+    so the store's daily write allowance (`--learn-daily-gib`, 32) is reached sooner. Off by default.
+  - `0128` `TF_GLM_SHARED_COPY=16`: a copy window grows in shared rounds as a lone stream's does. Four streams
+    repeating code: 120 -> 155 tok/s; one copying beside three writing prose: 34 -> 70 tok/s for it, the others
+    unchanged (17-20); hashes unchanged. Off by default.
+  - `0126`/`0127` (on; `TF_GLM_KEEP_RIDE=0`, `TF_GLM_DRAW_BATCH=0` restore the old paths): a shared round's keeps ride
+    on its next step, and sampled streams draw after one gather and one sync. Greedy hashes at 1/4/8 streams equal the
+    121-patch image's; the speed change is within run-to-run noise here (sampled 8 streams 92.8 -> 94-96 tok/s).
+  - `0123` (upstream `882ca0a7`): an unstarted resumed turn is ranked by its uncached tail, not behind a cold prefill.
+    `0124` `TF_QUEUE_KEEPS=1`: a queued request's kept state is not the first evicted. Both served without error;
+    neither is isolated by a measurement yet.
+  - Profile (`scripts/local.sh.example`): `PARALLEL=16 HEAD=q8 L2PF=1 PROMPT_CACHE_GIB=10 MEMORY_RESERVE_GIB=7.5`.
+    Startup: 16 streams, 4,098 pages, a 7.3 GiB prompt cache (9.6 at `PARALLEL=8`), about 7 GiB available on each
+    Spark under load. Decode, wall tok/s: 4 streams 75, 8 streams 98 (it was 75 at `PARALLEL=4`, the second four
+    queued about 20 s), 16 streams 123 with TTFT p50 1.2 s. `HEAD=q8 L2PF=1`: code at one stream 51.0 -> 53.7 tok/s
+    (same hash); prose replies change with the head's width. Sixteen sessions: 55 output tok/s, no errors.
+
 - **2026-11-15** -- `0122`: queued warm passes (patch `0104`) are capped at one a lane; the oldest beyond that are
   cancelled when a newer one is submitted. Foreground requests queue ahead of background ones, so while more agents
   than lanes kept a request always waiting, no warm pass reached the head and every reply queued another, each holding
